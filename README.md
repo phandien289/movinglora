@@ -40,9 +40,9 @@ Hệ thống được thiết kế theo kiến trúc **Master - Slave**, tối �
 
 | Tên Thiết Bị | Chân Module | Chân ESP32-S3 | Chức Năng / Ghi Chú |
 | :--- | :--- | :--- | :--- |
-| **LoRa E32-433T20D** | TXD | **GPIO 1** | RX1 của ESP32-S3 (Nhận dữ liệu) |
-| | RXD | **GPIO 2** | TX1 của ESP32-S3 (Gửi dữ liệu) |
-| | AUX | **GPIO 10** | Báo trạng thái bận/rảnh của LoRa |
+| **LoRa E32-433T20D** | TXD | **GPIO 16** | RX1 của ESP32-S3 (Nhận dữ liệu) |
+| | RXD | **GPIO 17** | TX1 của ESP32-S3 (Gửi dữ liệu) |
+| | AUX | **GPIO 18** | Báo trạng thái bận/rảnh của LoRa |
 | | M0 | **GPIO 11** | Chuyển chế độ hoạt động |
 | | M1 | **GPIO 12** | Chuyển chế độ hoạt động |
 | | VCC / GND | 5V / GND | Nguồn nuôi module (nên dùng nguồn ổn định) |
