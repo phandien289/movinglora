@@ -84,9 +84,9 @@ volatile unsigned long lastCommandTime = 0;
 // WATCHDOG AN TOÀN: Sau 650ms không nhận gói tin (hoặc heartbeat) -> Mất kết nối!
 const unsigned long SAFETY_TIMEOUT_MS = 650;
 
-// Gia tốc S-curve tối ưu phản hồi siêu tốc (< 35ms)
-volatile float accelRate = 0.060f;    // Tăng tốc dứt khoát (~35ms đạt full tốc độ)
-volatile float decelRate = 0.070f;    // Hãm phanh tức thì (~30ms dừng hẳn)
+// Gia tốc làm mịn chuyển động:
+volatile float accelRate = 0.002f;    // Tăng tốc êm ái
+volatile float decelRate = 0.007f;    // Hãm phanh từ từ
 volatile float steeringTrim = 0.0f;   // Bù lệch bánh khi chạy thẳng
 
 void applyEnPinState() {
