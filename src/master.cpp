@@ -1,27 +1,40 @@
 #include <Arduino.h>
-#include "TM1638Driver.h"
+#include <Wire.h>
+#include "DFRobot_BNO055.h"
 #include "E32LoRaDriver.h"
 
 /**
  * ============================================================================
- * ESP32-S3 MASTER NODE - BỘ ĐIỀU KHIỂN ROBOT OMNI QUA LORA E32 & TM1638
+ * ESP32-S3 MASTER NODE - BỘ ĐIỀU KHIỂN CỬ CHỈ BÀN TAY BẰNG DFROBOT BNO055
  * ============================================================================
- * - Hiển thị trên 8 LED 7 đoạn TM1638:
- *     + 4 LED bên trái (Digits 0..3): Hướng di chuyển ("FOr ", "bACK", "LEFt", "rIGt", "t-LF", "t-rt", "StOP")
- *     + 4 LED bên phải (Digits 4..7): Tốc độ cài đặt (Ví dụ: "S 75", "S 80", "S100")
- * - Phím bấm S1 -> S8:
- *     + S1: Tiến [F]       | S2: Lùi [B]
- *     + S3: Ngang trái [L] | S4: Ngang phải [R]
- *     + S5: Xoay trái [C]  | S6: Xoay phải [W]
- *     + S7: TĂNG TỐC ĐỘ (+5 RPM)
- *     + S8: GIẢM TỐC ĐỘ (-5 RPM)
+ * - Giao tiếp I2C với cảm biến 9 trục DFRobot BNO055:
+ *     + SDA: GPIO 4
+ *     + SCL: GPIO 5
+ * - Giao tiếp UART1 với module LoRa Ebyte E32-433T20D:
+ *     + RX:  GPIO 16 (Serial1 RX)
+ *     + TX:  GPIO 17 (Serial1 TX)
+ *     + AUX: GPIO 18
+ *     + M0:  GPIO 7
+ *     + M1:  GPIO 15
+ *
+ * - ÁNH XẠ CỬ CHỈ BÀN TAY (ĐÃ HOÁN ĐỔI PITCH VÀ ROLL THEO HƯỚNG LẮP ĐẶT THỰC TẾ):
+ *     1. Bàn tay để phẳng (Neutral Deadzone < 45°): DỪNG XE [S]
+ *     2. Trục Roll đảm nhận TIẾN / LÙI:
+ *        - Nghiêng chúc tay về trước (> 45°):       TIẾN [F]
+ *        - Nghiêng ngửa tay ra sau   (> 45°):       LÙI [B]
+ *     3. Trục Pitch đảm nhận TRÁI / PHẢI:
+ *        - Nghiêng lật tay sang trái (> 45°):       NGANG TRÁI [L]
+ *        - Nghiêng lật tay sang phải (> 45°):       NGANG PHẢI [R]
+ *     4. Trục Z (Yaw) đảm nhận XOAY TẠI CHỖ:
+ *        - Xoay cổ tay thuận KĐH     (> 35°):       XOAY PHẢI (CW) [W]
+ *        - Xoay cổ tay ngược KĐH     (> 35°):       XOAY TRÁI (CCW) [C]
  * ============================================================================
  */
 
-// Cấu hình chân TM1638 trên Master (ESP32-S3)
-#define TM_STB_PIN   4
-#define TM_CLK_PIN   5
-#define TM_DIO_PIN   6
+// Cấu hình chân I2C cho DFRobot BNO055
+#define I2C_SDA_PIN  4
+#define I2C_SCL_PIN  5
+#define BNO055_ADDR  0x28 // Địa chỉ I2C mặc định của DFRobot BNO055 (hoặc 0x29)
 
 // Cấu hình chân LoRa Ebyte E32-433T20D trên Master (ESP32-S3)
 #define LORA_RX_PIN  16 // ESP32-S3 RX1 (nối TXD của LoRa E32)
@@ -30,38 +43,46 @@
 #define LORA_M0_PIN  7  // ESP32-S3 Output (nối M0 của LoRa E32)
 #define LORA_M1_PIN  15 // ESP32-S3 Output (nối M1 của LoRa E32)
 
-TM1638Driver tm1638(TM_STB_PIN, TM_CLK_PIN, TM_DIO_PIN);
+// Khởi tạo đối tượng BNO055 từ thư viện DFRobot
+typedef DFRobot_BNO055_IIC BNO;
+BNO bno(&Wire, BNO055_ADDR);
+
+// Khởi tạo driver LoRa E32
 E32LoRaDriver lora(&Serial1, LORA_RX_PIN, LORA_TX_PIN, LORA_AUX_PIN, LORA_M0_PIN, LORA_M1_PIN);
 
-// Biến quản lý tốc độ xe (mặc định 75 RPM, khoảng 25 - 150 RPM)
-int currentSpeed = 75;
-bool s7Handled = false; // Chống lặp phím S7 (Tăng tốc)
-bool s8Handled = false; // Chống lặp phím S8 (Giảm tốc)
+// ============================================================================
+// CÀI ĐẶT NGƯỠNG GÓC KÍCH HOẠT (SETPOINTS) & ĐẢO CHIỀU NẾU CẦN
+// ============================================================================
+const float SETPOINT_FWD_BACK   = 45.0f; // Ngưỡng kích hoạt Tiến / Lùi (>= 45°)
+const float SETPOINT_LEFT_RIGHT = 45.0f; // Ngưỡng kích hoạt Trái / Phải (>= 45°)
+const float SETPOINT_Z_YAW      = 35.0f; // Ngưỡng kích hoạt Xoay CW / CCW (>= 35°)
 
-// Biến quản lý trạng thái chuyển động & chống rung
-uint8_t activeMoveKey = 0;           // Phím di chuyển S1..S6 hiện tại
-const uint8_t* activeDirSegs = DIR_READY; // Con trỏ mảng 4 ký tự hiển thị hướng hiện tại
-unsigned long lastReleaseTimer = 0;  // Mốc thời gian khi phát hiện phím chuyển động = 0
-const unsigned long RELEASE_DEBOUNCE_MS = 25; // Cần giữ phím = 0 liên tục 25ms mới tính là nhả
+// Cờ đảo chiều (Đổi true / false nếu chiều chuyển động bị ngược):
+const bool INVERT_FWD_BACK   = false; // Đổi true nếu chúc tay trước mà xe lại lùi
+const bool INVERT_LEFT_RIGHT = true;  // Đảo chiều: Lật tay trái -> Sang Trái (L), Lật tay phải -> Sang Phải (R)
+const bool INVERT_Z_YAW      = false; // Đổi true nếu xoay tay phải mà xe xoay trái
 
-// Biến quản lý thời gian phát lệnh
+// Quản lý mốc tham chiếu trục Z (Yaw Tare / Zeroing)
+float baseYaw = 0.0f;
+bool isBaseYawSet = false;
+unsigned long neutralStartTime = 0;
+const unsigned long AUTO_TARE_DELAY_MS = 1500; // Để phẳng tay liên tục 1.5s mới tự động cân lại mốc Yaw
+
+// Quản lý truyền LoRa
+const char* lastSentCmd = "S";
 unsigned long lastSendTime = 0;
 unsigned long lastHeartbeatTime = 0;
-const unsigned long SEND_INTERVAL_MS = 75;       // Chu kỳ phát lệnh khi giữ phím (75ms)
-const unsigned long HEARTBEAT_INTERVAL_MS = 200; // Chu kỳ phát heartbeat khi đứng yên (200ms)
-bool isMoving = false;
+const unsigned long SEND_INTERVAL_MS = 70;       // Gửi lặp lại mỗi 70ms khi đang điều khiển
+const unsigned long HEARTBEAT_INTERVAL_MS = 200; // Gửi heartbeat mỗi 200ms khi đứng yên
+const unsigned long LOG_INTERVAL_MS = 200;       // In log Serial mỗi 200ms
+unsigned long lastLogTime = 0;
 
-// Hàm phụ trợ lấy lệnh, vị trí LED và mảng 4 ký tự hướng từ phím bấm S1..S6
-const char* getMoveCommand(uint8_t moveKey, int &ledIdx, const uint8_t* &dirSegs) {
-    if (moveKey & 0x01) { ledIdx = 0; dirSegs = DIR_FWD;   return "F"; } // S1: Tiến
-    if (moveKey & 0x02) { ledIdx = 1; dirSegs = DIR_BACK;  return "B"; } // S2: Lùi
-    if (moveKey & 0x04) { ledIdx = 2; dirSegs = DIR_LEFT;  return "L"; } // S3: Ngang trái
-    if (moveKey & 0x08) { ledIdx = 3; dirSegs = DIR_RIGHT; return "R"; } // S4: Ngang phải
-    if (moveKey & 0x10) { ledIdx = 4; dirSegs = DIR_ROT_L; return "C"; } // S5: Xoay trái
-    if (moveKey & 0x20) { ledIdx = 5; dirSegs = DIR_ROT_R; return "W"; } // S6: Xoay phải
-    ledIdx = -1;
-    dirSegs = DIR_STOP;
-    return nullptr;
+// Hàm chuẩn hóa hiệu số 2 góc Yaw (-180° đến +180°)
+float normalizeAngleDiff(float angle, float reference) {
+    float diff = angle - reference;
+    while (diff > 180.0f) diff -= 360.0f;
+    while (diff < -180.0f) diff += 360.0f;
+    return diff;
 }
 
 void setup() {
@@ -74,173 +95,191 @@ void setup() {
     }
 
     Serial.println("\n========================================================");
-    Serial.println(" ESP32-S3 MASTER: CONTROLLER ROBOT OMNI (DUAL DISPLAY) ");
+    Serial.println(" ESP32-S3 MASTER: GESTURE CONTROLLER (DFROBOT BNO055)  ");
     Serial.println("========================================================");
 
-    // 1. Khởi tạo TM1638
-    tm1638.begin(7); // Độ sáng tối đa (7)
-    
-    // Hiệu ứng khởi động kiểm tra màn hình và 8 LED
-    for (int i = 0; i < 8; i++) {
-        tm1638.setLed(i, true);
-        delay(20);
+    // 1. Khởi tạo bus I2C trên GPIO 4 (SDA) và GPIO 5 (SCL)
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 400000);
+    Serial.printf("[I2C] Khoi tao bus I2C tren SDA=%d, SCL=%d (400kHz)\n", I2C_SDA_PIN, I2C_SCL_PIN);
+
+    // 2. Khởi tạo cảm biến DFRobot BNO055
+    bno.reset();
+    delay(50);
+
+    bool bnoReady = false;
+    for (int retry = 0; retry < 5; retry++) {
+        if (bno.begin() == BNO::eStatusOK) {
+            bnoReady = true;
+            break;
+        }
+        Serial.printf("[WARN] BNO055 chua phan hoi o dia chi 0x%02X, thu lai lan %d...\n", BNO055_ADDR, retry + 1);
+        delay(200);
     }
-    delay(60);
-    tm1638.clearAllLeds();
 
-    // Hiển thị khởi đầu: 4 LED trái "rdY ", 4 LED phải "S 75"
-    activeDirSegs = DIR_READY;
-    tm1638.showReady(currentSpeed);
-    Serial.printf("[OK] TM1638 san sang (Trai: 'rdY ' | Phai: 'S %d')\n", currentSpeed);
+    if (bnoReady) {
+        // Sử dụng chế độ IMU (Con quay hồi chuyển + Gia tốc kế):
+        // KHÔNG phụ thuộc vào từ kế, phản hồi trục Z (Heading) tức thì từ lúc bật nguồn!
+        bno.setOprMode(BNO::eOprModeImu);
+        Serial.println("[OK] DFRobot BNO055 san sang o che do IMU Fusion (Phan hoi truc Z tuc thi)");
+    } else {
+        Serial.println("[ERROR] KHONG TIM THAY BNO055! Kiem tra day noi SDA (4), SCL (5), VCC, GND.");
+    }
 
-    // 2. Khởi tạo LoRa E32-433T20D với Air Data Rate 19.2 kbps
+    // 3. Khởi tạo LoRa E32-433T20D với Air Data Rate 19.2 kbps
     lora.begin(9600, true);
     Serial.println("[OK] LoRa E32-433T20D san sang (Air Data Rate: 19.2 kbps)");
 
-    // Đồng bộ tốc độ khởi đầu sang Slave
-    char spdCmd[16];
-    snprintf(spdCmd, sizeof(spdCmd), "V%d", currentSpeed);
-    lora.sendPacket(spdCmd, 60);
+    // Lấy mốc Yaw đầu tiên sau khi cảm biến ổn định
+    delay(200);
+    BNO::sEulAnalog_t initEul = bno.getEul();
+    baseYaw = initEul.head;
+    isBaseYawSet = true;
 
     Serial.println("--------------------------------------------------------");
-    Serial.println("HUONG DAN PHIM BAM:");
-    Serial.println(" - S1: Tien [F]       | S2: Lui [B]");
-    Serial.println(" - S3: Ngang trai [L] | S4: Ngang phai [R]");
-    Serial.println(" - S5: Xoay trai [C]  | S6: Xoay phai [W]");
-    Serial.println(" - S7: TANG TOC DO (+5 RPM)");
-    Serial.println(" - S8: GIAM TOC DO (-5 RPM)");
-    Serial.println(" - Tha phim: Dung xe [S]");
-    Serial.println("========================================================");
+    Serial.println("HUONG DAN CU CHI BAN TAY (SETPOINT 45° / Z: 35°):");
+    Serial.println(" - De phang tay (<45 do)         -> Dung xe (S)");
+    Serial.println(" - Nghieng chuc tay truoc >45 do -> Tien (F) [Theo Roll]");
+    Serial.println(" - Nghieng ngua tay sau   >45 do -> Lui (B) [Theo Roll]");
+    Serial.println(" - Nghieng lat tay trai   >45 do -> Ngang Trai (L) [Theo Pitch]");
+    Serial.println(" - Nghieng lat tay phai   >45 do -> Ngang Phai (R) [Theo Pitch]");
+    Serial.println(" - Xoay co tay thuan KDH  >35 do -> Xoay Phai (W) [Theo Z]");
+    Serial.println(" - Xoay co tay nguoc KDH  >35 do -> Xoay Trai (C) [Theo Z]");
+    Serial.println("========================================================\n");
 }
 
 void loop() {
-    uint8_t rawKey = tm1638.readButtons();
     unsigned long now = millis();
 
-    // Tách riêng phím di chuyển (S1..S6: bit 0..5) và phím tốc độ (S7..S8: bit 6..7)
-    uint8_t moveKey  = rawKey & 0x3F; // Bit 0..5 (S1..S6)
-    uint8_t speedKey = rawKey & 0xC0; // Bit 6..7 (S7..S8)
+    // 1. Đọc góc Euler từ cảm biến BNO055
+    BNO::sEulAnalog_t eul = bno.getEul();
+
+    // Kiểm tra mất tín hiệu (tuột dây hoặc lỗi giao tiếp I2C)
+    bool bnoSignalLost = (bno.lastOperateStatus != BNO::eStatusOK);
 
     // ========================================================================
-    // 1. XỬ LÝ PHÍM TỐC ĐỘ: S7 (TĂNG TỐC) & S8 (GIẢM TỐC)
+    // NẾU MẤT TÍN HIỆU BNO055 -> NGẮT DỪNG NGAY ĐỘNG CƠ
     // ========================================================================
-    if (speedKey & 0x40) { // Phím S7: TĂNG TỐC ĐỘ
-        if (!s7Handled) {
-            s7Handled = true;
-            if (currentSpeed < 150) {
-                currentSpeed += 5; // Tăng 5 RPM mỗi lần bấm
-                char spdPacket[16];
-                snprintf(spdPacket, sizeof(spdPacket), "V%d", currentSpeed);
-                lora.sendPacket(spdPacket, 60);
+    if (bnoSignalLost) {
+        // Gửi ngay lệnh DỪNG (S) sang Slave để dừng xe lập tức
+        if (strcmp(lastSentCmd, "S") != 0 || (now - lastSendTime >= 100)) {
+            lastSentCmd = "S";
+            lora.sendPacket("S", 40);
+            lastSendTime = now;
+        }
 
-                // Cập nhật 4 LED phải hiển thị tốc độ mới
-                tm1638.updateDirectionAndSpeed(activeDirSegs, currentSpeed);
-                tm1638.setLed(6, true); // Bật LED trên nút S7 phản hồi thị giác
-                Serial.printf("[MASTER] S7 -> TANG TOC: %d RPM\n", currentSpeed);
-            }
+        // KHÔNG gửi Heartbeat 'H' để sau 650ms Watchdog trên Slave tự động ngắt ENA động cơ!
+
+        if (now - lastLogTime >= 500) {
+            lastLogTime = now;
+            Serial.println("[FAILSAFE] MAT TIN HIEU BNO055 -> DA GUI LENH DUNG (S) DE NGAT DONG CO!");
         }
-    } else {
-        if (s7Handled) {
-            s7Handled = false;
-            tm1638.setLed(6, false); // Tắt LED khi nhả nút S7
-        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+        return; // Dừng vòng lặp tại đây khi mất tín hiệu
     }
 
-    if (speedKey & 0x80) { // Phím S8: GIẢM TỐC ĐỘ
-        if (!s8Handled) {
-            s8Handled = true;
-            if (currentSpeed > 25) {
-                currentSpeed -= 5; // Giảm 5 RPM mỗi lần bấm
-                char spdPacket[16];
-                snprintf(spdPacket, sizeof(spdPacket), "V%d", currentSpeed);
-                lora.sendPacket(spdPacket, 60);
+    float rawPitch = eul.pitch;
+    float rawRoll  = eul.roll;
+    float rawYaw   = eul.head; // 0° đến 360°
 
-                // Cập nhật 4 LED phải hiển thị tốc độ mới
-                tm1638.updateDirectionAndSpeed(activeDirSegs, currentSpeed);
-                tm1638.setLed(7, true); // Bật LED trên nút S8 phản hồi thị giác
-                Serial.printf("[MASTER] S8 -> GIAM TOC: %d RPM\n", currentSpeed);
-            }
-        }
-    } else {
-        if (s8Handled) {
-            s8Handled = false;
-            tm1638.setLed(7, false); // Tắt LED khi nhả nút S8
-        }
+    // Hoán đổi Pitch và Roll theo phản hồi thực tế:
+    // - Roll điều khiển trục TIẾN / LÙI
+    // - Pitch điều khiển trục TRÁI / PHẢI
+    float fwdBackAngle   = (INVERT_FWD_BACK)   ? -rawRoll  : rawRoll;
+    float leftRightAngle = (INVERT_LEFT_RIGHT) ? -rawPitch : rawPitch;
+
+    // Tính độ lệch góc xoay Z so với mốc xuất phát
+    float deltaYaw = normalizeAngleDiff(rawYaw, baseYaw);
+    if (INVERT_Z_YAW) {
+        deltaYaw = -deltaYaw;
     }
 
-    // ========================================================================
-    // 2. XỬ LÝ PHÍM DI CHUYỂN: S1..S6 (TIẾN, LÙI, TRÁI, PHẢI, XOAY)
-    // ========================================================================
-    if (moveKey != 0) {
-        lastReleaseTimer = now;
+    // 2. Kiểm tra trạng thái phẳng (Neutral):
+    // CHỈ TỰ ĐỘNG CÂN LẠI MỐC YAW KHI CẢ 3 TRỤC ĐỀU NẰM TRONG VÙNG NGHỈ (< 20°)
+    // Tránh tình trạng đang xoay cổ tay mà bị auto-tare xóa mất góc lệch!
+    bool isTrulyAtRest = (fabs(fwdBackAngle) < 20.0f && fabs(leftRightAngle) < 20.0f && fabs(deltaYaw) < 18.0f);
+    if (isTrulyAtRest) {
+        if (neutralStartTime == 0) {
+            neutralStartTime = now;
+        } else if (now - neutralStartTime >= AUTO_TARE_DELAY_MS) {
+            // Khi giữ tay phẳng ổn định > 1.5s, cập nhật lại mốc Yaw mới
+            baseYaw = rawYaw;
+            deltaYaw = 0.0f;
+        }
+    } else {
+        neutralStartTime = 0; // Đang xoay hoặc nghiêng tay -> Khóa ngay Auto-tare
+    }
 
-        if (moveKey != activeMoveKey) {
-            // === BẤM PHÍM DI CHUYỂN MỚI HOẶC ĐỔI HƯỚNG (0ms DELAY) ===
-            activeMoveKey = moveKey;
-            int ledIdx = -1;
-            const uint8_t* dirSegs = nullptr;
-            const char* cmd = getMoveCommand(activeMoveKey, ledIdx, dirSegs);
+    // 3. Thuật toán nhận diện cử chỉ bàn tay (Gesture Detection)
+    const char* currentCmd = "S";
 
-            if (cmd != nullptr) {
-                activeDirSegs = dirSegs;
-
-                // Cập nhật 4 LED 7 đoạn bên trái (Hướng) và giữ nguyên tốc độ bên phải
-                tm1638.updateDirectionAndSpeed(activeDirSegs, currentSpeed);
-                tm1638.setSingleLed(ledIdx);
-
-                // Phát sóng tức thì ra LoRa
-                lora.sendPacket(cmd, 60);
-                lastSendTime = now;
-                lastHeartbeatTime = now;
-                isMoving = true;
-
-                Serial.printf("[MASTER] HUONG: %s | TOC DO: %d RPM\n", cmd, currentSpeed);
-            }
+    // ƯU TIÊN 1: Xoay cổ tay (Trục Z / Yaw >= 35°)
+    if (fabs(deltaYaw) >= SETPOINT_Z_YAW) {
+        if (deltaYaw > 0) {
+            currentCmd = "W"; // Xoay phải (CW)
         } else {
-            // === ĐANG NHẤN GIỮ PHÍM DI CHUYỂN (LẶP MỖI 75ms NUÔI WATCHDOG) ===
-            if (now - lastSendTime >= SEND_INTERVAL_MS) {
-                int ledIdx = -1;
-                const uint8_t* dirSegs = nullptr;
-                const char* cmd = getMoveCommand(activeMoveKey, ledIdx, dirSegs);
-                if (cmd != nullptr) {
-                    lora.sendPacket(cmd, 60);
-                    lastSendTime = now;
-                    lastHeartbeatTime = now;
+            currentCmd = "C"; // Xoay trái (CCW)
+        }
+    } 
+    // ƯU TIÊN 2: Nghiêng Tiến/Lùi hoặc Trái/Phải (>= 45°)
+    else {
+        bool fwdActive = (fabs(fwdBackAngle) >= SETPOINT_FWD_BACK);
+        bool sideActive = (fabs(leftRightAngle) >= SETPOINT_LEFT_RIGHT);
+
+        if (fwdActive || sideActive) {
+            // So sánh xem trục nào nghiêng rõ hơn để lấy hướng ưu tiên
+            if (fabs(fwdBackAngle) >= fabs(leftRightAngle)) {
+                if (fwdBackAngle < -SETPOINT_FWD_BACK) {
+                    currentCmd = "F"; // Tiến
+                } else if (fwdBackAngle > SETPOINT_FWD_BACK) {
+                    currentCmd = "B"; // Lùi
+                }
+            } else {
+                if (leftRightAngle < -SETPOINT_LEFT_RIGHT) {
+                    currentCmd = "L"; // Ngang trái
+                } else if (leftRightAngle > SETPOINT_LEFT_RIGHT) {
+                    currentCmd = "R"; // Ngang phải
                 }
             }
         }
-    } else {
-        // === KHÔNG CÓ PHÍM DI CHUYỂN NÀO ĐƯỢC NHẤN ===
-        if (activeMoveKey != 0) {
-            // Chống rung nhả phím: chỉ khi phím = 0 liên tục >= 25ms mới tính là thả thật
-            if (now - lastReleaseTimer >= RELEASE_DEBOUNCE_MS) {
-                // === XÁC NHẬN NHẢ TAY -> DỪNG PHANH XE ===
-                Serial.println("[MASTER] NHA PHIM -> DUNG PHANH XE (S)");
-                activeMoveKey = 0;
-                isMoving = false;
-                activeDirSegs = DIR_STOP;
+    }
 
-                // Cập nhật 4 LED trái thành "StOP", 4 LED phải giữ nguyên tốc độ
-                tm1638.showStop(currentSpeed);
-                tm1638.clearMoveLeds();
+    // 4. Phát lệnh sang Slave qua LoRa E32
+    bool isCommandActive = (strcmp(currentCmd, "S") != 0);
 
-                // Gửi lệnh DỪNG "S" đồng bộ qua LoRa
-                lora.sendPacketWaitDone("S", 80);
-                lora.sendPacketWaitDone("S", 80);
+    if (strcmp(currentCmd, lastSentCmd) != 0) {
+        // Có sự thay đổi cử chỉ: Phát lệnh mới NGAY LẬP TỨC
+        lastSentCmd = currentCmd;
+        lora.sendPacket(currentCmd, 60);
+        lastSendTime = now;
+        lastHeartbeatTime = now;
 
-                lastSendTime = now;
-                lastHeartbeatTime = now;
-            }
-        } else {
-            // === ĐỨNG YÊN (IDLE) -> PHÁT HEARTBEAT MỖI 200ms ===
-            if (now - lastHeartbeatTime >= HEARTBEAT_INTERVAL_MS) {
-                lora.sendPacket("H", 40);
-                lastHeartbeatTime = now;
-            }
+        Serial.printf(">>> [CU CHI MOI] -> %s (TienLui: %.1f | TraiPhai: %.1f | dZ: %.1f)\n", 
+                      currentCmd, fwdBackAngle, leftRightAngle, deltaYaw);
+    } 
+    else if (isCommandActive) {
+        // Đang duy trì cử chỉ di chuyển: Phát lặp mỗi 70ms để nuôi Watchdog trên Slave
+        if (now - lastSendTime >= SEND_INTERVAL_MS) {
+            lora.sendPacket(currentCmd, 60);
+            lastSendTime = now;
+            lastHeartbeatTime = now;
+        }
+    } 
+    else {
+        // Tay đang ở trạng thái Dừng (S): Phát Heartbeat mỗi 200ms báo sóng ổn định
+        if (now - lastHeartbeatTime >= HEARTBEAT_INTERVAL_MS) {
+            lora.sendPacket("H", 40);
+            lastHeartbeatTime = now;
         }
     }
 
-    // Quét phím chu kỳ 2ms
-    vTaskDelay(pdMS_TO_TICKS(2));
-}
+    // 5. In Serial log chu kỳ 200ms để theo dõi trực quan
+    if (now - lastLogTime >= LOG_INTERVAL_MS) {
+        lastLogTime = now;
+        Serial.printf("Tien/Lui: %5.1f | Trai/Phai: %5.1f | Xoay Z: %5.1f (dZ: %5.1f) | Lenh: [%s]\n",
+                      fwdBackAngle, leftRightAngle, rawYaw, deltaYaw, currentCmd);
+    }
 
+    // Chu kỳ quét cử chỉ 20ms (50Hz)
+    vTaskDelay(pdMS_TO_TICKS(20));
+}
